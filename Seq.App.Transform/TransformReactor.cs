@@ -7,19 +7,17 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using System.Timers;
 
 namespace Seq.App.Transform
 {
     [SeqApp("Transform",
         Description = "Collects events and allows a javascript to transform them into different events written back to the log.")]
-    public class TransformReactor : Reactor, ISubscribeTo<LogEventData>
+    public class TransformReactor : SeqApp, ISubscribeTo<LogEventData>
     {
         private Queue<LogEventData> _window;
         private Timer _timer;
-        private ConcurrentDictionary<string, bool> _incidents = new ConcurrentDictionary<string, bool>();
+        private readonly ConcurrentDictionary<string, bool> _incidents = new ConcurrentDictionary<string, bool>();
 
         [SeqAppSetting(
             DisplayName = "Window (seconds)",
@@ -43,43 +41,45 @@ namespace Seq.App.Transform
         {
             base.OnAttached();
 
-            _window = new Queue<LogEventData>();
-
-            if (IntervalSeconds > 0)
+            lock (this)
             {
-                _timer = new Timer();
-                _timer.Interval = IntervalSeconds * 1000;
-                _timer.Elapsed += (s, e) =>
-                {
-                    lock (this)
-                    {
-                        Transform();
-                    }
-                };
-                _timer.Start();
+                _window = new Queue<LogEventData>();
             }
 
+            if (IntervalSeconds <= 0) return;
+            _timer = new Timer
+            {
+                AutoReset = false,
+                Enabled = false,
+                Interval = IntervalSeconds * 1000,
+                Site = null,
+                SynchronizingObject = null
+            };
+            _timer.Elapsed += (s, e) =>
+            {
+                lock (this)
+                {
+                    Transform();
+                }
+            };
+            _timer.Start();
         }
         
         private static double? ToDouble(object v)
         {
-            if (v is NumberInstance)
+            switch (v)
             {
-                return ((NumberInstance)v).Value;
+                case NumberInstance instance:
+                    return instance.Value;
+                case double d:
+                    return d;
+                case decimal @decimal:
+                    return (double)@decimal;
+                case long l:
+                    return l;
+                default:
+                    return null;
             }
-            else if (v is double)
-            {
-                return (double)v;
-            }
-            else if (v is decimal)
-            {
-                return (double)(decimal)v;
-            }
-            else if (v is long)
-            {
-                return (long)v;
-            }
-            return null;
         }
 
         /// <summary>
@@ -89,8 +89,8 @@ namespace Seq.App.Transform
         /// <returns></returns>
         private static object FixDecimal(object v)
         {
-            if (v is decimal)
-                return (double)(decimal)v;
+            if (v is decimal @decimal)
+                return (double)@decimal;
             return v;
         }
 
@@ -98,40 +98,31 @@ namespace Seq.App.Transform
         {
             try
             {
-                List<LogEventData> window;
-
-                if (WindowSeconds > 0)
-                {
-                    window = _window.Where(r => r.LocalTimestamp >= DateTime.Now.AddSeconds(-WindowSeconds)).ToList();
-                }
-                else
-                {
-                    window = new List<LogEventData>();
-                }
+                List<LogEventData> window = WindowSeconds > 0 ? _window.Where(r => r.LocalTimestamp >= DateTime.Now.AddSeconds(-WindowSeconds)).ToList() : new List<LogEventData>();
 
                 if (WindowSeconds <= 0 && _window.Any())
                 {
                     window.Add(_window.Last());
                 }
 
-                var engine = new ScriptEngine();
-                engine.EnableExposedClrTypes = true;
+                ScriptEngine engine = new ScriptEngine { EnableExposedClrTypes = true };
 
-                var properties = new Dictionary<string, ArrayInstance>
+                Dictionary<string, ArrayInstance> properties = new Dictionary<string, ArrayInstance>
                 {
                     { "$Id", engine.Array.Construct() },
                     { "$Level", engine.Array.Construct() },
                     { "$Timestamp", engine.Array.Construct() },
                     { "$Message", engine.Array.Construct() },
                 };
-                foreach (var e in window)
+
+                foreach (LogEventData e in window)
                 {
                     properties["$Id"].Push(e.Id);
                     properties["$Level"].Push(e.Level);
                     properties["$Timestamp"].Push(e.LocalTimestamp);
                     properties["$Message"].Push(e.RenderedMessage);
 
-                    foreach (var p in e.Properties)
+                    foreach (KeyValuePair<string, object> p in e.Properties)
                     {
                         if (!properties.ContainsKey(p.Key))
                         {
@@ -148,9 +139,9 @@ namespace Seq.App.Transform
                 engine.SetGlobalValue("max", new Aggregator(engine, properties, r =>
                 {
                     double? result = null;
-                    foreach (var v in r.ElementValues)
+                    foreach (object v in r.ElementValues)
                     {
-                        var d = ToDouble(v);
+                        double? d = ToDouble(v);
                         if (d != null && result == null || result < d)
                         {
                             result = d;
@@ -164,9 +155,9 @@ namespace Seq.App.Transform
                 engine.SetGlobalValue("min", new Aggregator(engine, properties, r =>
                 {
                     double? result = null;
-                    foreach (var v in r.ElementValues)
+                    foreach (object v in r.ElementValues)
                     {
-                        var d = ToDouble(v);
+                        double? d = ToDouble(v);
                         if (d != null && result == null || d < result)
                         {
                             result = d;
@@ -181,14 +172,13 @@ namespace Seq.App.Transform
                 {
                     double sum = 0;
                     int count = 0;
-                    foreach (var v in r.ElementValues)
+                    foreach (object v in r.ElementValues)
                     {
-                        var d = ToDouble(v);
-                        if (d != null)
-                        {
-                            sum += (double)d;
-                            count += 1;
-                        }
+                        double? d = ToDouble(v);
+                        if (d == null) continue;
+
+                        sum += (double)d;
+                        count += 1;
                     }
 
                     return sum / count;
@@ -196,35 +186,25 @@ namespace Seq.App.Transform
 
                 engine.SetGlobalValue("sum", new Aggregator(engine, properties, r =>
                 {
-                    double sum = 0;
-                    foreach (var v in r.ElementValues)
-                    {
-                        var d = ToDouble(v);
-                        if (d != null)
-                        {
-                            sum += (double)d;
-                        }
-                    }
-
-                    return sum;
+                    return r.ElementValues.Select(ToDouble).Where(d => d != null).Sum(d => (double)d);
                 }));
 
-                var verbose = new Action<StringInstance, object>((a, b) => GetLoggerFor(b).Verbose(a.Value));
-                var debug = new Action<StringInstance, object>((a, b) => GetLoggerFor(b).Debug(a.Value));
-                var information = new Action<StringInstance, object>((a, b) => GetLoggerFor(b).Information(a.Value));
-                var warning = new Action<StringInstance, object>((a, b) => GetLoggerFor(b).Warning(a.Value));
-                var error = new Action<StringInstance, object>((a, b) => GetLoggerFor(b).Error(a.Value));
-                var fatal = new Action<StringInstance, object>((a, b) => GetLoggerFor(b).Fatal(a.Value));
-                
-                engine.SetGlobalFunction("logTrace", verbose);
-                engine.SetGlobalFunction("logVerbose", verbose);
-                engine.SetGlobalFunction("logDebug", debug);
-                engine.SetGlobalFunction("logInfo", information);
-                engine.SetGlobalFunction("logInformation", information);
-                engine.SetGlobalFunction("logWarn", warning);
-                engine.SetGlobalFunction("logWarning", warning);
-                engine.SetGlobalFunction("logError", error);
-                engine.SetGlobalFunction("logFatal", fatal);
+                void Verbose(StringInstance a, object b) => GetLoggerFor(b).Verbose(a.Value);
+                void Debug(StringInstance a, object b) => GetLoggerFor(b).Debug(a.Value);
+                void Information(StringInstance a, object b) => GetLoggerFor(b).Information(a.Value);
+                void Warning(StringInstance a, object b) => GetLoggerFor(b).Warning(a.Value);
+                void Error(StringInstance a, object b) => GetLoggerFor(b).Error(a.Value);
+                void Fatal(StringInstance a, object b) => GetLoggerFor(b).Fatal(a.Value);
+
+                engine.SetGlobalFunction("logTrace", (Action<StringInstance, object>)Verbose);
+                engine.SetGlobalFunction("logVerbose", (Action<StringInstance, object>)Verbose);
+                engine.SetGlobalFunction("logDebug", (Action<StringInstance, object>)Debug);
+                engine.SetGlobalFunction("logInfo", (Action<StringInstance, object>)Information);
+                engine.SetGlobalFunction("logInformation", (Action<StringInstance, object>)Information);
+                engine.SetGlobalFunction("logWarn", (Action<StringInstance, object>)Warning);
+                engine.SetGlobalFunction("logWarning", (Action<StringInstance, object>)Warning);
+                engine.SetGlobalFunction("logError", (Action<StringInstance, object>)Error);
+                engine.SetGlobalFunction("logFatal", (Action<StringInstance, object>)Fatal);
 
                 engine.SetGlobalFunction("openIncident", new Action<StringInstance>(name =>
                 {
@@ -276,74 +256,25 @@ namespace Seq.App.Transform
 
         private static object ToClrType(object v)
         {
-            if (v is ArrayInstance)
+            switch (v)
             {
-                return ((ArrayInstance)v).ElementValues.Select(ToClrType).ToList();
+                case ArrayInstance instance:
+                    return instance.ElementValues.Select(ToClrType).ToList();
+                case ClrInstanceWrapper wrapper:
+                    return wrapper.WrappedInstance;
+                case ObjectInstance instance:
+                    return instance.Properties.ToDictionary(r => r.Name, r => ToClrType(r.Value));
+                default:
+                    return v;
             }
-            if (v is ClrInstanceWrapper)
-            {
-                return ((ClrInstanceWrapper)v).WrappedInstance;
-            }
-            if (v is ObjectInstance)
-            {
-                return ((ObjectInstance)v).Properties.ToDictionary(r => r.Name, r => ToClrType(r.Value));
-            }
-            return v;
         }
 
         private ILogger GetLoggerFor(object properties)
         {
-            var l = Log;
-            if (properties != null && properties is ObjectInstance)
-            {
-                foreach (var prop in ((ObjectInstance)properties).Properties)
-                {
-                    l = l.ForContext(prop.Name, ToClrType(prop.Value), true);
-                }
-            }
-            return l;
-        }
+            ILogger l = Log;
+            if (!(properties is ObjectInstance instance)) return l;
 
-        private class Aggregate : ObjectInstance
-        {
-            private readonly IList<LogEventData> _data;
-
-            public Aggregate(ScriptEngine engine, IList<LogEventData> data)
-                : base(engine)
-            {
-                PopulateFunctions();
-                _data = data;
-            }
-
-            public decimal length
-            {
-                get { return _data.Count(); }
-            }
-
-            private IEnumerable<decimal> SelectDecimal(string property)
-            {
-                return _data.Select(r => r.Properties.ContainsKey(property) ? Convert.ToDecimal(r.Properties[property]) : 0);
-            }
-
-            public decimal sum(string property)
-            {
-                return SelectDecimal(property).Sum();
-            }
-
-            public decimal max(string property)
-            {
-                return SelectDecimal(property).Max();
-            }
-
-            public decimal min(string property)
-            {
-                return SelectDecimal(property).Min();
-            }
-
-            public decimal avg(string property)
-            {
-                return SelectDecimal(property).Average();
-            }
+            return instance.Properties.Aggregate(l, (current, prop) => current.ForContext(prop.Name, ToClrType(prop.Value), true));
         }
 
         public void On(Event<LogEventData> evt)
@@ -371,6 +302,5 @@ namespace Seq.App.Transform
                 }
             }
         }
-        
     }
 }
